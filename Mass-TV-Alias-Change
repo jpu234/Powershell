@@ -1,0 +1,126 @@
+# Found via https://www.reddit.com/r/teamviewer/comments/1asiik8/mass_deployment_using_powershell_aliass/ (https://pastebin.com/XVYKksP4)
+
+# This script checks if TeamViewer is installed and if the device is managed by a specific company.
+# It then fetches the computer name, gets user logon events, and filters out system and admin accounts.
+# The script finally updates the TeamViewer device name with the computer name and the last logged-in user.
+
+
+# Checks if the device is managed by the expected company.
+$registryPath = "HKLM:\SOFTWARE\WOW6432Node\TeamViewer" ## Assuming 32-bit TeamViewer, change if you are using 64-bit one
+$registryKey = "OwningManagerCompanyName"
+$expectedCompanyName = "Put in the name of your company here" # Replace with the actual company name
+
+# Checks if TeamViewer exists in the registry. If it doesn't, the script quits with exit code 10.
+if (Test-Path $registryPath) {
+    Write-Host "TeamViewer registry key found."
+} else {
+    Write-Host "TeamViewer registry key not found. Exiting with code 10."
+    exit 10
+}
+
+
+
+try {
+    $value = Get-ItemPropertyValue $registryPath $registryKey
+    if ($value -eq $expectedCompanyName) {
+        Write-Output "$registryKey found and has value $expectedCompanyName"
+    }
+    elseif ($value -ne $null) {
+        Write-Output "$registryKey found but it has different value $value , exiting with code 11"
+        exit 11
+    }
+    else {
+        Write-Output "$registryKey not found in given reg directory, exiting with code 12"
+        exit 12
+    }
+}
+catch {
+    Write-Output "Key not found. Exiting."
+    exit 13
+}
+
+
+$clientID = Get-ItemProperty $registryPath
+if($clientID.ClientID -eq $null){
+    Write-Host "no Client ID to base the device identity on, exiting with code 14."
+    exit 14
+}
+$remoteID = "r"+$clientID.ClientID
+$localMachine = $env:COMPUTERNAME
+if($localMachine -eq $null){
+    Write-Host "Something wrong with computername, exiting with code 15."
+    exit 15
+}
+
+# Fetches the computer name.
+$machineName = hostname
+
+# Defines the origin date/time as per the UNIX Timestamp standard, i.e., January 1st, 1970 at midnight.
+$unixEpoch = New-Object -TypeName DateTime -ArgumentList 1970, 1, 1, 0, 0, 0, 0
+
+# Gets user logon events and sorts them based on login time.
+$logonEvents = Get-CimInstance CCM_UserLogonEvents -Namespace 'Root\ccm' | Sort-Object LogonTime -Descending | Select-Object -ExcludeProperty PSComputerName, RunspaceId
+
+# Initializes an array to hold the formatted results.
+$formattedLogons = @()
+
+# Temporarily sets the error preference to silently continue.
+$oldErrorPreference = $ErrorActionPreference
+$ErrorActionPreference = 'SilentlyContinue'
+
+# Formats the results and adds them to the formattedLogons array.
+$logonEvents | ForEach-Object {
+    $logonTime = ([System.DateTime]$unixEpoch.AddSeconds($_.LogonTime).ToLocalTime())
+    $logonDate = $logonTime
+
+    $customObject =  New-Object Psobject
+    $customObject | Add-Member -type NoteProperty -name "LogonDate" -value $logonDate
+    $customObject | Add-Member -type NoteProperty -name "UserName" -value ((New-Object System.Security.Principal.SecurityIdentifier($_.UserSID)).Translate([System.Security.Principal.NTAccount]))
+    $customObject | Add-Member -type NoteProperty -name "SID" -value $_.UserSID
+    $formattedLogons += $customObject
+}
+
+# Filters the formattedLogons to remove admin/system/empty accounts.
+$filteredLogons = $formattedLogons | Where {$_.UserName -notlike "SYSTEM" -and $_.UserName -notlike "admin*" -and $_.UserName -ne "Administrator" -and $_.UserName -ne $null} # You will probably want to add more exceptions here
+$firstLogon = $filteredLogons | Select-Object -First 1
+$lastLoggedInUser = $firstLogon.UserName.Value
+$userDisplayName = $lastLoggedInUser -split "\\" | Select-Object -Last 1
+
+# Exits if userDisplayName is null.
+if($userDisplayName -eq $null){
+    exit 16
+}
+
+# Updates the TeamViewer device name with the computer name and the last logged-in user.
+if ($userDisplayName -is [string] -and $userDisplayName.Length -gt 3 -and $userDisplayName.Length -lt 40) {
+    $userDisplayName = "- " + $userDisplayName
+} else {
+    $userDisplayName = "- not known"
+}
+
+$deviceOwner = $userDisplayName
+
+$authHeader = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+$apiToken = 'put-your-teamviewer-token-here'
+$authHeader.Add("authorization", "Bearer $apiToken")
+
+$deviceList = Invoke-RestMethod -Uri "https://webapi.teamviewer.com/api/v1/devices" -Method Get -Headers $authHeader
+ForEach($device in $deviceList.devices){
+    If($device.remotecontrol_id -eq $remoteID)
+    {
+        $deviceID = $device.device_id
+    }
+}
+if($deviceID -eq $null){
+    Write-Host "this client it is not part of the right pool. Exiting with code 17."
+    exit 17
+}
+$updateBody = (@{Alias = "$localMachine $deviceOwner"}) | ConvertTo-Json
+Invoke-RestMethod -Uri "https://webapi.teamviewer.com/api/v1/devices/$deviceID" -Method PUT -Headers $authHeader -ContentType application/json -Body $updateBody
+
+Write-Host "Sent request to TeamViewer API to update the name of the device to $localMachine $deviceOwner"
+
+#Set Error action preference back to original value
+$ErrorActionPreference = $oldErrorPreference
+
+exit 20
